@@ -11,7 +11,8 @@ namespace {
 
 class TrackingAllocator final : public Fw::MallocAllocator {
   public:
-    TrackingAllocator() : m_deallocateCount(0), m_lastAllocate(nullptr), m_lastDeallocate(nullptr), m_lastDeallocateId(0) {}
+    TrackingAllocator()
+        : m_deallocateCount(0), m_lastAllocate(nullptr), m_lastDeallocate(nullptr), m_lastDeallocateId(0) {}
 
     void* allocate(const FwEnumStoreType identifier,
                    FwSizeType& size,
