@@ -9,6 +9,7 @@
 
 #include <limits>
 #include <new>
+#include "Fw/Types/Assert.hpp"
 
 namespace Baremetal {
 
@@ -26,7 +27,12 @@ constexpr FwOpcodeType OPCODE_UNUSED = std::numeric_limits<FwOpcodeType>::max();
 // ----------------------------------------------------------------------
 
 PassiveCmdDispatcher::PassiveCmdDispatcher(const char* const compName)
-    : PassiveCmdDispatcherComponentBase(compName), m_seq(0) {}
+    : PassiveCmdDispatcherComponentBase(compName), m_seq(0) {
+    // Emit OpCodeDispatched/OpCodeCompleted events for all ports by default, matching Svc::CmdDispatcher
+    for (FwIndexType i = 0; i < NUM_SEQCMDSTATUS_OUTPUT_PORTS; i++) {
+        this->m_eventEnabled[i] = true;
+    }
+}
 
 PassiveCmdDispatcher::CmdTables::CmdTables() {
     for (auto i = 0; i < CMD_DISPATCHER_DISPATCH_TABLE_SIZE; i++) {
@@ -100,20 +106,12 @@ void PassiveCmdDispatcher::compCmdStat_handler(FwIndexType portNum,
     // This opcode is reserved for internal use
     FW_ASSERT(opCode != OPCODE_UNUSED, portNum);
 
-    // Check the command response and log success/failure
-    if (response.e == Fw::CmdResponse::OK) {
-        this->log_COMMAND_OpCodeCompleted(opCode);
-    } else {
-        FW_ASSERT(response.e != Fw::CmdResponse::OK);
-        this->log_COMMAND_OpCodeError(opCode, response);
-    }
-
     // Search for the command source
     FwIndexType portToCall = -1;
     U32 context = 0;
     for (auto pending = 0; pending < CMD_DISPATCHER_SEQUENCER_TABLE_SIZE; pending++) {
         auto entry = &this->m_cmdTables->m_sequenceTracker[pending];
-        if ((entry->opcode != OPCODE_UNUSED) && (entry->seq == cmdSeq)) {
+        if ((entry->seq == cmdSeq) && (entry->opcode != OPCODE_UNUSED)) {
             portToCall = entry->callerPort;
             context = entry->context;
             FW_ASSERT(opCode == entry->opcode);
@@ -123,12 +121,30 @@ void PassiveCmdDispatcher::compCmdStat_handler(FwIndexType portNum,
             break;
         }
     }
-    // If found, call the port to report the command status
-    if ((portToCall != -1) && this->isConnected_seqCmdStatus_OutputPort(portToCall)) {
-        // NOTE: seqCmdStatus port forwards three arguments (opCode, cmdSeq, response) but the
-        // cmdSeq value has no meaning for the calling sequencer; instead, the context value is
-        // forwarded to allow the caller to utilize it if needed.
-        this->seqCmdStatus_out(portToCall, opCode, context, response);
+
+    FW_ASSERT(portToCall < NUM_SEQCMDSTATUS_OUTPUT_PORTS, static_cast<FwAssertArgType>(portToCall),
+              static_cast<FwAssertArgType>(NUM_SEQCMDSTATUS_OUTPUT_PORTS));
+
+    if (portToCall != -1) {
+        // Check the command response and log success/failure
+        if (response.e == Fw::CmdResponse::OK) {
+            if (this->m_eventEnabled[portToCall]) {
+                this->log_COMMAND_OpCodeCompleted(opCode);
+            }
+        } else {
+            FW_ASSERT(response.e != Fw::CmdResponse::OK);
+            // Errors are always reported, regardless of the port's event emission setting
+            this->log_COMMAND_OpCodeError(opCode, response);
+        }
+
+        if (this->isConnected_seqCmdStatus_OutputPort(portToCall)) {
+            // NOTE: seqCmdStatus port forwards three arguments (opCode, cmdSeq, response) but the
+            // cmdSeq value has no meaning for the calling sequencer; instead, the context value is
+            // forwarded to allow the caller to utilize it if needed.
+            this->seqCmdStatus_out(portToCall, opCode, context, response);
+        }
+    } else {
+        this->log_WARNING_LO_UnexpectedCommandResponse(opCode, cmdSeq, response);
     }
 }
 
@@ -145,13 +161,14 @@ void PassiveCmdDispatcher::seqCmd_helper(FwIndexType portNum,
         for (auto slot = 0; slot < CMD_DISPATCHER_DISPATCH_TABLE_SIZE; slot++) {
             if (this->m_cmdTables->m_entryTable[slot].opcode == opcode) {
                 entry = &this->m_cmdTables->m_entryTable[slot];
+                break;
             }
         }
     }
-    if ((entry != nullptr) && this->isConnected_compCmdSend_OutputPort(entry->port)) {
+    if (entry != nullptr && this->isConnected_compCmdSend_OutputPort(entry->port)) {
         // Register the command in the command tracker only if the response port is connected
+        bool pendingFound = false;
         if (this->isConnected_seqCmdStatus_OutputPort(portNum)) {
-            bool pendingFound = false;
             for (U32 pending = 0; pending < CMD_DISPATCHER_SEQUENCER_TABLE_SIZE; pending++) {
                 SequenceTracker* trackerEntry = &this->m_cmdTables->m_sequenceTracker[pending];
                 if (trackerEntry->opcode == OPCODE_UNUSED) {
@@ -163,27 +180,28 @@ void PassiveCmdDispatcher::seqCmd_helper(FwIndexType portNum,
                     break;
                 }
             }
-            // If no slot was found to track the command, quit
-            if (!pendingFound) {
-                this->log_WARNING_HI_TooManyCommands(opcode);
-                if (this->isConnected_seqCmdStatus_OutputPort(portNum)) {
-                    this->seqCmdStatus_out(portNum, opcode, context, Fw::CmdResponse::EXECUTION_ERROR);
-                }
-                return;
-            }
+        }
+        // Pass arguments to the argument buffer and log the dispatched command.
+        // Even if we did got find a sequencer slot, still send the command as we must ensure all critical commands can
+        // be completed.
+        this->compCmdSend_out(entry->port, opcode, this->m_seq, args);
+        FW_ASSERT(portNum < NUM_SEQCMDSTATUS_OUTPUT_PORTS, static_cast<FwAssertArgType>(portNum),
+                  static_cast<FwAssertArgType>(NUM_SEQCMDSTATUS_OUTPUT_PORTS));
+        if (this->m_eventEnabled[portNum]) {
+            this->log_COMMAND_OpCodeDispatched(opcode, entry->port);
         }
 
-        // Pass arguments to the argument buffer and log the dispatched command
-        this->compCmdSend_out(entry->port, opcode, this->m_seq, args);
-        this->log_COMMAND_OpCodeDispatched(opcode, entry->port);
+        if (!pendingFound) {  // PassiveCmdDispatcher::compCmdStat_handler will not clear the sequence
+            this->log_WARNING_HI_TooManyCommands(opcode);
+            this->seqCmdStatus_out(portNum, opcode, context, Fw::CmdResponse::EXECUTION_ERROR);
+        }
     } else {
-        // Opcode could not be found in the dispatch table, fail the command
+        // Branch taken when opcode fails to properly resolve to a mapped connected port.
         this->log_WARNING_HI_InvalidCommand(opcode);
         if (this->isConnected_seqCmdStatus_OutputPort(portNum)) {
             this->seqCmdStatus_out(portNum, opcode, context, Fw::CmdResponse::INVALID_OPCODE);
         }
     }
-
     // Increment sequence number
     this->m_seq++;
 }
@@ -225,10 +243,32 @@ void PassiveCmdDispatcher::CMD_CLEAR_TRACKING_cmdHandler(FwOpcodeType opCode, U3
     FW_ASSERT(this->m_cmdTables != nullptr);
 
     // Clear the sequence tracking table
-    for (FwOpcodeType entry = 0; entry < CMD_DISPATCHER_SEQUENCER_TABLE_SIZE; entry++) {
-        this->m_cmdTables->m_sequenceTracker[entry].opcode = OPCODE_UNUSED;
+    for (auto i = 0; i < CMD_DISPATCHER_SEQUENCER_TABLE_SIZE; i++) {
+        SequenceTracker* entry = &(this->m_cmdTables->m_sequenceTracker[i]);
+        FwOpcodeType entry_opcode = entry->opcode;
+        if ((entry_opcode != OPCODE_UNUSED) && (entry->seq != cmdSeq)) {
+            // Alert the other callers that the SequenceTracker table is cleared and their pending status won't arrive.
+            entry->opcode = OPCODE_UNUSED;
+            if (this->isConnected_seqCmdStatus_OutputPort(entry->callerPort)) {
+                this->seqCmdStatus_out(entry->callerPort, entry_opcode, entry->context, Fw::CmdResponse::CLEARED);
+            }
+        }
     }
     this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::OK);
+}
+
+void PassiveCmdDispatcher ::SET_EVENT_EMISSION_cmdHandler(FwOpcodeType opCode,
+                                                          U32 cmdSeq,
+                                                          U8 portIdx,
+                                                          const Fw::Enabled& enabled) {
+    if (portIdx >= NUM_SEQCMDSTATUS_OUTPUT_PORTS) {
+        this->log_WARNING_LO_PortIndexOutOfRange(portIdx);
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::EXECUTION_ERROR);
+    } else {
+        this->m_eventEnabled[portIdx] = (enabled == Fw::Enabled::ENABLED);
+        this->log_ACTIVITY_HI_EventEmissionSet(portIdx, enabled);
+        this->cmdResponse_out(opCode, cmdSeq, Fw::CmdResponse::OK);
+    }
 }
 
 }  // namespace Baremetal
